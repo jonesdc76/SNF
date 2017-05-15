@@ -1,0 +1,107 @@
+#include "SNF.C"
+#include "TGraph.h"
+#include "TH1D.h"
+#include "TStyle.h"
+#include "TPad.h"
+#include "TAxis.h"
+#include "TPaveText.h"
+#include "TPaveStats.h"
+#include "TROOT.h"
+#include "TCanvas.h"
+
+TGraph* SNFfraction(int det, double lowE = 1.8, double highE = 12,
+		    int start_week=0, int end_week=187, int core=-1,
+		    bool add_old_SNF=1, double reactor_off_scaling=2.0)
+{
+  bool add_error = false;
+  gStyle->SetTitleW(0.82);
+  gStyle->SetTitleFontSize(0.1);
+  const int nBins = 10;
+  gStyle->SetOptStat(0);
+  int start = start_week;
+  int end = end_week;
+  if(start_week<0 || start_week>187)start = 0;
+  if(end_week<0 || end_week>187)end = 1;
+  SNF snf;
+  int nCore = snf.kReactor;
+  snf.SetReactorOffScaling(reactor_off_scaling);
+  snf.Configure("SNF.config");
+  snf.LoadReactorPowerTree("WeeklyReactorData.root", "tree");
+  snf.ParameterizeSNFvsT(0);
+  if(add_error)snf.AddRandomError();
+  snf.IsolateSingleReactorContribution(core);
+  if(det>=snf.kDetector)det = 0;
+  for(int icore=0;icore<nCore;++icore)
+    snf.FindRefuelTimes(icore);
+
+
+  //Add refuels prior to P15A data at expected rate for each reactor
+  if(add_old_SNF){
+    //Add 5 refuels (~7-8 yr)for Daya Bay 1,2 
+    for(int i=0;i<5;++i){
+      snf.InsertRefuelTime(0);
+      snf.InsertRefuelTime(1);
+    }
+    //Add 7 refuels (~7 yr)for Ling Ao 1 and 2
+    for(int i=0;i<7;++i){
+      snf.InsertRefuelTime(2);
+      snf.InsertRefuelTime(3);
+     }
+    //Add 1 refuels (~1 yr)for Ling Ao 3 
+    snf.InsertRefuelTime(4);
+    //Add 0 refuels (~1 yr)for Ling Ao 4 
+    //snf.InsertRefuelTime(5);
+  }
+ 
+  int nweeks = int(end - start+1);
+  double *week = new double[nweeks];
+  double *spec = new double[nweeks];
+  double sum = 0;
+  int nwks = 0;
+  // double lowE = snf.IBDthresh();
+  // int size = (int)snf.vDB_EbinCenter.size();
+  // double highE = snf.vDB_EbinCenter[size-1] + 0.5*snf.vDB_EbinWidth[size-1];
+  for(int i=0;i<nweeks;++i){
+    if(i%10==0)
+      cout<<"Week "<<i+start<<endl;
+    week[nwks] = i+start;
+    //set to 0 for when EH2-AD2 not yet operating
+    if(det == 3 && i<32)
+      spec[nwks] = 0;
+    else
+      spec[nwks] = snf.RelDetectorResponseSpectrum(det, lowE, highE, i+start);
+    if(!(spec[nwks] == snf.kError))
+      ++nwks;
+  }
+  gStyle->SetOptFit(1111);
+  TCanvas *c = new TCanvas("c","c",0,0,800,550);
+  c->SetGrid();
+  TGraph *gr = new TGraphErrors(nwks, week, spec);
+  gr->SetMinimum(0);
+  gr->SetMaximum(5);
+  gr->Draw("alp");
+  gr->SetTitle(Form("SNF Contribution to Antineutrino Flux at Detector %i from Week %i to %i ", det, start, end));
+  gr->SetMarkerColor(kBlue);
+  gr->SetLineColor(kBlue);
+  gr->SetMarkerStyle(20);
+  gr->SetMarkerSize(0.5);
+  gPad->Update();
+  gr->GetXaxis()->SetTitleSize(0.036);
+  gr->GetXaxis()->SetRangeUser(-3,190);
+  gr->GetYaxis()->SetLimits(0,gr->GetYaxis()->GetXmax()*1.15);
+  gr->GetYaxis()->SetRangeUser(0,gr->GetYaxis()->GetXmax()*1.15);
+  gr->GetYaxis()->SetTitleSize(0.036);
+  gr->GetXaxis()->SetTitle("Weeks Since Dec 24, 2011");
+  gr->GetYaxis()->SetTitle("SNF Flux/Reactor Flux (%)");
+  TF1 *f = new TF1("f","pol0", 40, 190);
+  gr->Fit(f, (det==3 ? "r":""));
+  gPad->Update();
+  TPaveStats *ps = (TPaveStats*)(gr->GetListOfFunctions()->FindObject("stats"));
+  ps->SetX1NDC(0.55);
+  ps->SetX2NDC(0.9);
+  ps->SetY1NDC(0.75);
+  ps->SetY2NDC(0.9);
+  ps->Draw();
+  c->SaveAs(Form("Det%i_SNF_fraction_over_P15A_Roffscale%i%s.png",det,(int)reactor_off_scaling, (add_old_SNF ? "_refuel_hist" : "_no_refuel_hist")));
+  return gr;
+}

@@ -1,0 +1,1126 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include "TROOT.h"
+#include "TMath.h"
+#include "TString.h"
+#include "TFile.h"
+#include "TLeaf.h"
+#include "TGraphErrors.h"
+#include "TF1.h"
+#include "TAxis.h"
+#include "TPad.h"
+#include "TVirtualFitter.h"
+#include "TFitResultPtr.h"
+#include "SNF.h"
+
+SNF::SNF()
+{
+  fSpectrumError = 0;//Relative uncertainty in reference SNF spectrum 
+  fBaselineError = 15;//Absolute uncertainty in baseline in meters
+  fAlphaError = 0;//Relative uncertainty in Alpha(): burnup per cycle for a reactor
+  fRefuelTimeError = 0;//relative error in time between refuels before P15A
+  fAtDayLevelPrecision = false;
+  fIncludeProbSurvival = true;
+  fIsolateReactorContribution = false;
+  fAddRandomError = false;
+  fSingleReactor = -1;
+  fNEnergyBins = 0;
+  fNTimeBins = 0;
+  fNWeeksInP15A = 0;
+  fDBSpectrumIntegral = 0;
+  fDeltaE = 0.01;
+  fReactorOffScaling = 2.0;
+  fBurnupScaleFactor[0] = 1.33333333;
+  fBurnupScaleFactor[1] = 1.33333333;
+  fBurnupScaleFactor[2] = 1.0;
+  fBurnupScaleFactor[3] = 1.0;
+  fBurnupScaleFactor[4] = 1.0;
+  fBurnupScaleFactor[5] = 1.0;
+  PName[0] = "SNF_DB1";
+  PName[1] = "SNF_DB2";
+  PName[2] = "SNF_LA1";
+  PName[3] = "SNF_LA2";
+  PName[4] = "SNF_LA3";
+  PName[5] = "SNF_LA4";
+  RName[0] = "DB1";
+  RName[1] = "DB2";
+  RName[2] = "LA1";
+  RName[3] = "LA2";
+  RName[4] = "LA3";
+  RName[5] = "LA4";
+  RProperName[0] = "Daya Bay 1";
+  RProperName[1] = "Daya Bay 2";
+  RProperName[2] = "Ling Ao 1";
+  RProperName[3] = "Ling Ao 2";
+  RProperName[4] = "Ling Ao 3";
+  RProperName[5] = "Ling Ao 4";
+  DName[0] = "EH1-AD1";
+  DName[1] = "EH1-AD2";
+  DName[2] = "EH2-AD1";
+  DName[3] = "EH2-AD2";
+  vRefuelTimes.resize(kReactor);
+  vRefuelFreq.push_back(77);//every 77 weeks for Daya Bay 1
+  vRefuelFreq.push_back(77);//every 77 weeks for Daya Bay 2
+  vRefuelFreq.push_back(52);//every 52 weeks for Ling Ao 1
+  vRefuelFreq.push_back(52);//every 52 weeks for Ling Ao 2
+  vRefuelFreq.push_back(52);//every 52 weeks for Ling Ao 3
+  vRefuelFreq.push_back(52);//every 52 weeks for Ling Ao 4
+  rand = new TRandom(0);
+}
+
+SNF::~SNF()
+{
+  if(!RPTree)
+    return;
+  delete RPTree->GetCurrentFile();
+}
+
+double SNF::AbsDayaBaySpectrum(double E)//measured Daya Bay X-section at E (MeV)
+{
+  if(vDB_Spectrum.size()==0){
+    cout<<"Load configuration file first to load Daya Bay spectrum. Exiting\n";
+    exit(0);
+  }
+  double spec = double(kError);
+  int size = (int)vDB_EbinCenter.size();
+  if(E < IBDthresh() || E >= vDB_EbinCenter[size-1] + 0.5*vDB_EbinWidth[size-1])
+    return 0;
+  for(int i=0;i<(int)vDB_Spectrum.size();++i){
+    double center = vDB_EbinCenter[i];
+    double width = vDB_EbinWidth[i];
+    if(E < center + 0.5*width && E >= center - 0.5*width){
+      spec = vDB_Spectrum[i];
+      break;
+    }
+  }
+  return spec;
+}
+
+double SNF::AbsDetectorResponseSpectrum(int det, double lowE, double highE, int week)//absolute SNF flux between lE and hE (in MeV) and for week since beginning of P15A dataset at specified detector location convoluted with measured Daya Bay spectrum. 
+{
+  //approximate integral by summing over Npts bins
+  int Npts = int((highE-lowE)/fDeltaE);
+  double dE = (highE-lowE)/(double)Npts;//multiple of interval close to fDeltaE
+  double sum = 0;
+  //Convert from percent to fractional
+  double scale = 0.01;
+  for (int ien = 0; ien<Npts; ++ien){
+    double E = lowE + ien * dE; 
+    double relspec = RelSpectrumAtDet(det, E, week);
+    if(relspec == kError)return double(kError);
+    sum += scale * relspec * AbsDayaBaySpectrum(E) * dE;
+    //cout<<"E="<<E<<": "<< RelSpectrumAtDet(det, E, week);
+    //cout<<"*"<<AbsDayaBaySpectrum(E)<<endl;
+  }
+  sum /= (highE-lowE);
+  //cout<<sum<<endl;
+  return sum;
+}
+
+int SNF::AddRandomError()//add Gaussian error to the various elements of spectrum to determine spread for error calculation
+{
+  fAddRandomError = true;
+  if(vSNFofT.size()==0){
+    cout<<"Spectrum must be parameterized before random error added.\n";
+    return -1;
+  }
+
+  //Error in SNF positions
+  for(int icore=0;icore<kReactor;++icore){
+      vSNFPos[icore][0] += rand->Gaus(0, fBaselineError);
+      vSNFPos[icore][1] += rand->Gaus(0, fBaselineError);
+  }
+
+  //Error in Alpha() (burnup)
+  for(int icore=0;icore<kReactor;++icore){
+    double sigma =  fBurnupScaleFactor[icore] * fAlphaError;
+    fBurnupScaleFactor[icore] += rand->Gaus(0, sigma);
+    if(fBurnupScaleFactor[icore] < 0)fBurnupScaleFactor[icore] = 0;
+  }
+  //Error in reference SNF spectrum
+  //Add random error to shape (energy evolution) of spectrum not time evolution.
+  //First four parameters are exponential amplitudes so add random
+  //component to each amplitude (same component for all amplitude 
+  //parameters in a time evolution parametrization but different
+  //for each energy bin).
+  for(int ien=0;ien< fNEnergyBins;++ien){
+    double scale = 1.0 + rand->Gaus(0, fSpectrumError);
+    if(scale < 0)scale = 0;
+    for(int ipar=0;ipar<4;++ipar){
+      vSNFofT[ien]->SetParameter(ipar, vSNFofT[ien]->GetParameter(ipar)*scale);
+    }
+  }
+  return 0;
+}
+
+double SNF::Alpha(int core){//scale factor accounts for SNF with burnup != 45GWd/tU
+  if(core >= kReactor){
+    cout<<"Alpha(): Core requested out of range. Exiting.\n";
+    exit(0);
+  }
+  return fBurnupScaleFactor[core];
+}
+
+double SNF::BaselineCore(int det, int core)//distance from detector to core
+{
+  double dx2 = pow(vDetPos[det][0] - vCorePos[core][0], 2);
+  double dy2 = pow(vDetPos[det][1] - vCorePos[core][1], 2);
+  double dz2 = pow(vDetPos[det][2] - vCorePos[core][2], 2);
+  return sqrt(dx2 + dy2 + dz2);
+}
+
+double SNF::BaselineSNF(int det, int core)//distance from detector to SNF pool
+{
+  double dx2 = pow(vDetPos[det][0] - vSNFPos[core][0], 2);
+  double dy2 = pow(vDetPos[det][1] - vSNFPos[core][1], 2);
+  double dz2 = pow(vDetPos[det][2] - vSNFPos[core][2], 2);
+  return sqrt(dx2 + dy2 + dz2);
+}
+
+double SNF::Beta(int core, double E, double days)//fractional contribution (relative to full reactor output) to neutrino flux spectrum from a given reactor as a function of days from beginning of P15A
+{
+  if(core >= kReactor){
+    cout<<"Beta(): Core requested out of range. Exiting.\n";
+    exit(0);
+  }
+  //Allows contributions from all reactor cores to a particular detector
+  //to be separately calculated.
+  if(fIsolateReactorContribution && core != fSingleReactor){
+    return 0.0;
+  }
+  double frac = 0;
+  if(vRefuelTimes[core].size()==0)
+    FindRefuelTimes(core);
+  int week = int(days/double(kDaysInWeek));
+  double alpha = Alpha(core);
+  double del = Delta(core, week);
+
+  double re1_spec = RelSpectrumSim(E, days);
+  int n = 0, nv = 0; 
+  for(int i=0;i<int(vRefuelTimes[core].size());++i){
+    double t =  vRefuelTimes[core][i];
+    if(t*kDaysInWeek<=days){
+      //cout<<"Beta():: core="<<core<<",  E="<<E<<" at "<<days-t*kDaysInWeek;
+      //cout<<" days since refuel.\n";
+      frac += alpha*del*RelSpectrumSim(E, days - t*kDaysInWeek);
+      if(t>0) ++n;
+      else ++nv;
+    }
+  }
+  //  cout<<"Summed over "<<n<<" known refueling periods and "
+  //  cout<<nv<<" virtual ones.\n";
+  return frac;
+}
+ 
+int SNF::Configure(const char *filename)//Read parameters from config file
+{
+  ifstream file(filename);
+  if(!(file.good()&&file.is_open())){
+    cout<<"Config file not found exiting.\n";
+    return -1;
+  }
+
+  string line;
+
+  //Get positions of detectors
+  ////////////////////////////
+  vDetPos.resize(kDetector);
+  bool found = 0;
+  while(file.good()){
+    getline(file, line);
+    if(line.find("Detector positions x y")<100){
+      found = 1;
+      break;
+    }
+  }
+  if(!found){
+    cout<<"Detector position data not found. Exiting!\n";
+    exit(0);
+  }
+  int n = 0;
+  char temp[255];
+  for(int i=0;i<kDetector;++i){
+    double x, y, z;
+    file>>temp>>x>>y>>z;
+    for(int j=0;j<kDetector;++j){
+      if(DName[j].CompareTo(temp)==0){
+	cout<<DName[j].Data()<<" x= "<<x<<", y= "<<y<<", z= "<<z<<endl;
+	vDetPos[j].push_back(x);
+	vDetPos[j].push_back(y);
+	vDetPos[j].push_back(z);
+	++n;
+	break;
+      }
+    }
+  }
+  if(n<kDetector){
+    cout<<"Not all detector positions found. Exiting.\n";
+    exit(0);
+  }
+  file.seekg(0);
+
+
+  //Get positions of reactors
+  ////////////////////////////
+  vCorePos.resize(kReactor);
+  found = 0;
+  while(file.good()){
+    getline(file, line);
+    if(line.find("Reactor positions x y")<100){
+      found = 1;
+      break;
+    }
+  }
+  if(!found){
+    cout<<"Reactor position data not found. Exiting.\n";
+    exit(0);
+  }
+  n = 0;
+  for(int i=0;i<kReactor;++i){
+    double x, y, z;
+    file>>temp>>x>>y>>z;
+    for(int j=0;j<kReactor;++j){
+      if(RName[j].CompareTo(temp)==0){
+	cout<<RName[j].Data()<<" x= "<<x<<", y= "<<y<<", z= "<<z<<endl;
+	vCorePos[j].push_back(x);
+	vCorePos[j].push_back(y);
+	vCorePos[j].push_back(z);
+	++n;
+	break;
+      }
+    }
+  }
+  if(n<kDetector){
+    cout<<"Not all reactor positions found. Exiting.\n";
+    exit(0);
+  }
+  file.seekg(0);
+
+  //Get positions of SNF pools
+  ////////////////////////////
+  vSNFPos.resize(kReactor);
+  found = 0;
+  while(file.good()){
+    getline(file, line);
+    if(line.find("SNF pool positions x y")<100){
+      found = 1;
+      break;
+    }
+  }
+  if(!found){
+    cout<<"SNF pool position data not found. Exiting.\n";
+    exit(0);
+  }
+  n = 0;
+  for(int i=0;i<kReactor;++i){
+    double x, y, z;
+    file>>temp>>x>>y>>z;
+    for(int j=0;j<kReactor;++j){
+      if(PName[j].CompareTo(temp)==0){
+	cout<<PName[j].Data()<<" x= "<<x<<", y= "<<y<<", z= "<<z<<endl;
+	vSNFPos[j].push_back(x);
+	vSNFPos[j].push_back(y);
+	vSNFPos[j].push_back(z);
+	++n;
+	break;
+      }
+    }
+  }
+  // for(int i=0;i<kReactor;++i){
+  //   vSNFPos[i][0] = vCorePos[i][0];
+  //   vSNFPos[i][1] = vCorePos[i][1];
+  //   cout<<"Remember to revert. Test loop sets SNF pool at position of cores.\n";
+  // }
+  if(n<kDetector){
+    cout<<"Not all SNF pool positions found. Exiting.\n";
+    exit(0);
+  }
+  file.seekg(0);
+
+
+  //Get rated power output of reactors
+  char ln[33] = "Reactor rated output power in GW";
+  vReactorPower.resize(kReactor);
+  found = 0;
+  while(file.good()){
+    getline(file, line);
+    if(line.find("Reactor rated output power in GW")<100){
+      found = 1;
+      break;
+    }
+  }
+  if(!found){
+    cout<<"Reactor power data not found. Exiting.\n";
+    exit(0);
+  }
+  n = 0;
+  for(int i=0;i<kReactor;++i){
+    double pow = 0;
+    file>>temp>>pow;
+    for(int j=0;j<kReactor;++j){
+      if(RName[j].CompareTo(temp)==0){
+	//	cout<<RName[j].Data()<<" reactor power "<<pow<<endl;
+	vReactorPower[j] = pow;
+	++n;
+	break;
+      }
+    }
+  }
+  if(n<kReactor){
+    cout<<"Not all reactor power data found. Exiting.\n";
+    exit(0);
+  }
+  file.seekg(0);
+
+  //Find and extract the reference SNF spectrum of E and t
+  /////////////////////////////////////////////////////////
+  while(file.good()){
+    getline(file, line);
+    if(line.find("#day\\\\MeV")<100)break;
+    file.peek();
+    if(file.eof()){
+      cout<<"Error. End of configuration file reached.\n";
+      exit(0);
+    }
+  }
+  getline(file, line);
+  stringstream ss(line);
+
+  //Get the energy bin low edges
+  while(ss.getline(temp,10,' ')){
+    if(temp[0] != '|' && temp[0] != 0){
+      vEnergy.push_back(atof(temp));
+    }
+  }
+  //Skip the line of hyphens
+  while(getline(file,line)){
+    if(line.find_first_of("-----")<100){break;}
+    if(file.eof()){
+      cout<<"Error. End of configuration file reached.\n";
+      exit(0);
+    }
+  }
+
+  //Get time and spectra from table
+  int size = vSpectrum.size();
+  while(getline(file,line)){
+    if(line.find("-----")<10)break;
+    stringstream s(line);
+    s.getline(temp,10,' ');
+    vTime.push_back(atof(temp));
+
+    vSpectrum.resize(size+1);
+    while(s.getline(temp,20,' ')){
+      if(temp[0] != '|' && temp[0] != 0){
+	vSpectrum[size].push_back(atof(temp));
+	//cout<<"S "<<vSpectrum[size].back()<<endl;
+      }
+    }
+    file.peek();
+    if(file.eof())break;
+    size = vSpectrum.size();
+  }
+
+  //Find and extract the parametrization of the  SNF spectrum
+  ///////////////////////////////////////////////////////////
+  while(file.good()){
+    getline(file, line);
+    if(line.find("#Table of best fit parameters")<100)break;
+    file.peek();
+    if(file.eof()){
+      cout<<"Error. End of configuration file reached.\n";
+      exit(0);
+    }
+  }
+  getline(file, line);
+
+  //Skip the energy bins and line of hyphens
+  while(getline(file,line)){
+    if(line.find_first_of("-----")<100){break;}
+    if(file.eof()){
+      cout<<"Error. End of configuration file reached.\n";
+      exit(0);
+    }
+  }
+
+  //Get time and spectra from table
+  size = vParameter.size();
+  while(getline(file,line)){
+    if(line.find("-----")<10)break;
+    stringstream s(line);
+    s.getline(temp,20,' ');
+    vParameter.resize(size+1);
+    while(s.getline(temp,20,' ')){
+      if(temp[0] != '|' && temp[0] != 0){
+	vParameter[size].push_back(atof(temp));
+	//cout<<"P "<<vParameter[size].back()<<endl;
+      }
+    }
+    file.peek();
+    if(file.eof())break;
+    size = vParameter.size();
+  }
+  file.seekg(0);
+  //  vParameter.resize(npar);
+
+  //Import the measured Daya Bay Spectrum
+  ////////////////////////////////////////
+
+  //Look for keywords
+  while(getline(file, line)){
+    if(line.find("#Daya Bay measured antineutrino")<10)break;
+    file.peek();
+    if(file.eof()){
+      cout<<"End of configuration file reached before Daya Bay spectrum found.";
+      cout<<" Exiting.\n";
+      exit(0);
+    }
+  }
+  //skip to table
+  while(getline(file, line)){
+    if(line.find("-----")<10)break;
+    file.peek();
+    if(file.eof()){
+      cout<<"End of configuration file reached before Daya Bay spectrum found.";
+      cout<<" Exiting.\n";
+      exit(0);
+    }
+  }
+  double en=0, width, cnts;
+  while(en<8.5){
+    file>>en>>width>>cnts;
+    vDB_EbinCenter.push_back(en);
+    vDB_EbinWidth.push_back(width);
+    vDB_Spectrum.push_back(cnts); 
+    cout<<"DB "<<en<<" "<<width<<" "<<cnts<<endl;
+  }
+  if(abs(vDB_EbinCenter[0] - 0.5*vDB_EbinWidth[0] - IBDthresh()) >  1e-10){
+    cout<<"Problem: low edge of Daya Bay spectrum should match IBDthresh(). ";
+    cout<<"Fix this and then run program again.\n";
+    exit(0);
+  }
+  //Normalize Daya Bay Spectrum
+  double norm = IntegrateDBfluxSpectrum();
+  for(int i=0;i<(int)vDB_EbinCenter.size();++i){
+    vDB_Spectrum[i]/=norm;
+  }
+  cout<<"Daya Bay spectrum now normalized to "<<IntegrateDBfluxSpectrum()<<endl;
+  file.close();
+  fNTimeBins = vTime.size();
+  cout<<"time bins: "<<fNTimeBins<<endl;
+  fNEnergyBins = vEnergy.size();
+  FindAvgProbSurvival(0);
+  return 0;
+}
+
+double SNF::Delta(int core, int week)//scale factor to account for the
+//greater SNF contribution when the reactor is off for refueling etc.
+{
+  if(core >= kReactor){
+    cout<<"ReactorPower(): Core requested out of range. Exiting.\n";
+    exit(0);
+  }
+  if(week >= fNWeeksInP15A){
+    cout<<"ReactorPower(): Time requested out of range of P15A. Exiting.\n";
+    exit(0);
+  }
+  if(ReactorPower(core, week) > MinOnPower())return 1.0;
+  else return ReactorOffScaling();
+}
+
+void SNF::FindAvgProbSurvival(bool verbose){
+  if(vDetPos.size()==0){
+    cout<<"Configuration file must be loaded first to obtain baselines. ";
+    cout<<"Exiting \n";
+    exit(0);
+  }
+  vAvgProbSurvival.resize(kDetector);
+  int end = (int)vDB_EbinCenter.size() - 1;
+  double lowE = vDB_EbinCenter[0]-vDB_EbinWidth[0];
+  double highE = vDB_EbinCenter[end]-vDB_EbinWidth[end];
+  int Npts = int((highE-lowE)/fDeltaE);
+  double dE = (highE-lowE)/(double)Npts;//multiple of interval close to fDeltaE
+  for(int idet=0;idet<kDetector;++idet){
+    for(int icore=0;icore<kReactor;++icore){
+      double sum = 0, norm = 0;
+      for (int ien = 0; ien<=Npts; ++ien){
+	double E = lowE + ien * dE; 
+	double psur =  ProbSurvival(BaselineCore(idet, icore), E);
+	sum += AbsDayaBaySpectrum(E) * psur * dE;
+	norm += AbsDayaBaySpectrum(E) * dE;
+      }
+      if(verbose){
+	cout<<Form("P_survival(det ")<<idet<<", core "<<icore<<"): "<<sum/norm<<"\n";
+      }
+      vAvgProbSurvival[idet].push_back(sum/norm);
+    }
+  }
+  return;
+}
+
+int SNF::FindRefuelTimes(int core)//Find refueling times for each reactor
+{
+  if(core >= kReactor){
+    cout<<"FindRefuelTimes(): Core requested out of range. Exiting.\n";
+    exit(0);
+  }
+
+  double pwr, u235frac;
+  RPTree->ResetBranchAddresses();
+  RPTree->SetBranchAddress(Form("%s_Power", RName[core].Data()), &pwr);
+  RPTree->SetBranchAddress(Form("fracU235_%s", RName[core].Data()), &u235frac);
+  for(int i=0;i<RPTree->GetEntries();++i){
+    RPTree->GetEntry(i);
+    double week = i;
+    if(pwr < MinOnPower()){
+      RPTree->GetEntry(i-2);
+      double endfrac = u235frac;
+      RPTree->GetEntry(i);
+      while(pwr < 0.5){
+	++i;
+	if(i>=RPTree->GetEntries())
+	  break;
+	RPTree->GetEntry(i);
+      }
+      //      cout<<"Week "<<i<<" "<<u235frac-endfrac<<endl;
+      if(u235frac-endfrac > 0.1){
+	vRefuelTimes[core].push_back(week);
+	//Estimate day of week when reactor turned off by multiplying
+	//previous week's reactor average fractional output by 7
+	cout<<"Refuel core "<<RName[core].Data()<<" at week "<<week<<endl;
+      }
+    }
+  }
+  RPTree->ResetBranchAddresses();
+  return (int)vRefuelTimes[core].size();
+}
+
+TGraph * SNF::GetAbsDayaBaySpectrumGraph()//return TGraph of Daya Bay cross section spectrum
+{
+  int nbins = (int)vDB_EbinCenter.size();
+  double *y = new double[nbins];
+  for(int i=0; i<nbins; ++i){
+    double E = vDB_EbinCenter[i];
+    y[i] = AbsDayaBaySpectrum(E);
+  }
+  gr = new TGraph(nbins, vDB_EbinCenter.data(), y);
+  gr->SetLineColor(kBlue);
+  gr->SetMarkerColor(kRed);
+  gr->SetMarkerStyle(7);
+  gr->SetTitle(Form("Daya Bay Detector Spectrum"));
+
+  gr->Draw("alp");
+  gPad->Update();
+  gr->GetXaxis()->SetTitle("Energy (MeV)");
+  gr->GetYaxis()->SetTitle("Normalized Counts (arb)");
+  gr->GetXaxis()->SetTitleSize(0.04);
+  gr->GetYaxis()->SetTitleSize(0.04);
+  gPad->Update();
+  return gr;
+}
+
+TH1D* SNF::GetAbsDayaBaySpectrumHisto()//return TH1D of Daya Bay cross section spectrum
+{
+  int size = (int)vDB_Spectrum.size();
+  //  cout<<size<<endl;
+  double *edges = new double[size + 1];
+  edges[0] = vDB_EbinCenter[0] - 0.5 * vDB_EbinWidth[0];
+  for(int i=0;i<(int)size;++i){
+    edges[i+1] = vDB_EbinCenter[i] + 0.5 * vDB_EbinWidth[i];
+    //      cout<<edges[i+1]<<endl;
+  }
+  hSpec = new TH1D("hSpec", "hSpec", size, edges);
+  for(int i=0; i<size;++i){
+    hSpec->SetBinContent(i+1,vDB_Spectrum[i]);
+  }
+  hSpec->SetLineColor(kBlue);
+  hSpec->SetMarkerColor(kRed);
+  hSpec->SetMarkerStyle(7);
+  hSpec->SetTitle(Form("Daya Bay Detector Spectrum"));
+
+  hSpec->Draw();
+  gPad->Update();
+  hSpec->GetXaxis()->SetTitle("Energy (MeV)");
+  hSpec->GetYaxis()->SetTitle("Normalized Counts (arb)");
+  hSpec->GetXaxis()->SetTitleSize(0.04);
+  hSpec->GetYaxis()->SetTitleSize(0.04);
+  gPad->Update();
+  return hSpec;
+}
+
+TGraph* SNF::GetAbsSNFSpectrumGraph(int det, int week)//return TGraph of absolute spectrum for det at week
+{
+  int nbins = 10;
+  double *y = new double[nbins];
+  for(int i=0; i<nbins; ++i){
+    double low = vDB_EbinCenter[i] - 0.5*vDB_EbinWidth[i];
+    double high = low + vDB_EbinWidth[i];
+    y[i] = AbsDetectorResponseSpectrum(det, low, high, week);
+  }
+  gr = new TGraph(nbins, vDB_EbinCenter.data(), y);
+  gr->SetLineColor(kBlue);
+  gr->SetMarkerColor(kRed);
+  gr->SetMarkerStyle(7);
+  gr->SetTitle(Form("SNF contribution to %s for Week %i", 
+		    DName[det].Data(), week));
+  gr->Draw("alp");
+  gPad->Update();
+  gr->GetYaxis()->SetTitle("Counts (arb)");
+  gr->GetXaxis()->SetTitleSize(0.04);
+  gr->GetYaxis()->SetTitleSize(0.04);
+  gr->GetYaxis()->SetTitleOffset(1.1);
+  gr->GetXaxis()->SetTitle("Energy (MeV)");
+  gPad->Update();
+  return gr;
+}
+
+TH1D* SNF::GetAbsSNFSpectrumHisto(int det, int week)//return TH1D of absolute spectrum for det at week
+{
+  int nbins = 10;
+  double *edges = new double[nbins + 1];
+  edges[0] = vDB_EbinCenter[0] - 0.5 * vDB_EbinWidth[0];
+  for(int i=0;i<nbins;++i){
+    edges[i+1] = vDB_EbinCenter[i] + 0.5 * vDB_EbinWidth[i];
+    //      cout<<edges[i+1]<<endl;
+  }
+  hSpec = new TH1D("hSpec", "hSpec", nbins, edges);
+  for(int i=0; i<nbins; ++i){
+    double low = vDB_EbinCenter[i] - 0.5*vDB_EbinWidth[i];
+    double high = low + vDB_EbinWidth[i];
+    double y = AbsDetectorResponseSpectrum(det, low, high, week);
+    hSpec->SetBinContent(i+1,y);
+  }
+  hSpec->SetLineColor(kBlue);
+  hSpec->SetMarkerColor(kRed);
+  hSpec->SetMarkerStyle(7);
+  hSpec->SetTitle(Form("SNF contribution to %s for Week %i", 
+		    DName[det].Data(), week));
+  hSpec->Draw();
+  gPad->Update();
+  hSpec->GetYaxis()->SetTitle("Counts (arb)");
+  hSpec->GetXaxis()->SetTitleSize(0.04);
+  hSpec->GetYaxis()->SetTitleSize(0.04);
+  hSpec->GetYaxis()->SetTitleOffset(1.1);
+  hSpec->GetXaxis()->SetTitle("Energy (MeV)");
+  gPad->Update();
+  return hSpec;
+}
+
+double SNF::GetAlphaError()//Relative uncertainty in Alpha(): burnup per cycle
+{
+  return fAlphaError;
+}
+
+double SNF::GetAvgProbSurvival(int det, int core)//return average survival probabilities for each detector-reactor combination
+{ if(vAvgProbSurvival.size()==0)FindAvgProbSurvival(1);
+  return vAvgProbSurvival[det][core];
+}
+
+double SNF::GetBaselineError()//Absolute uncertainty in baseline
+{
+  return fBaselineError;
+}
+
+double SNF::GetDBSpectrumIntegral()//return integral of DB flux spectrum 
+{
+  return fDBSpectrumIntegral;
+}
+
+TString SNF::GetDetectorName(int det)
+{
+  if(det >= kDetector){
+    cout<<"GetDetectorName(): Detector requested out of range. Exiting.\n";
+    exit(0);
+  }
+  return DName[det];
+}
+
+TString SNF::GetReactorName(int core)
+{
+  if(core >= kReactor){
+    cout<<"GetReactorName(): Core requested out of range. Exiting.\n";
+    exit(0);
+  }
+  return RProperName[core];
+}
+
+TGraph* SNF::GetRelSNFSpectrumGraph(int det, int week)//return TGraph of fractional (%) spectrum for det at week
+{
+  int nbins = 10;
+  double *y = new double[nbins];
+  for(int i=0; i<nbins; ++i){
+    double low = vDB_EbinCenter[i] - 0.5*vDB_EbinWidth[i];
+    double high = low + vDB_EbinWidth[i];
+    y[i] = RelDetectorResponseSpectrum(det, low, high, week);
+  }
+  gr = new TGraph(nbins, vDB_EbinCenter.data(), y);
+  gr->SetLineColor(kBlue);
+  gr->SetMarkerColor(kRed);
+  gr->SetMarkerStyle(7);
+  gr->SetTitle(Form("Fractional SNF Contribution to %s for Week %i", 
+		    DName[det].Data(), week));
+  gr->Draw("alp");
+  gPad->Update();
+  gr->GetYaxis()->SetTitle("Fractional SNF Contribution (%)");
+  gr->GetXaxis()->SetTitleSize(0.04);
+  gr->GetYaxis()->SetTitleSize(0.04);
+  gr->GetXaxis()->SetTitle("Energy (MeV)");
+  gPad->Update();
+  return gr;
+}
+
+TH1D* SNF::GetRelSNFSpectrumHisto(int det, int week)//return TH1D of fractional (%) spectrum for det at week
+{
+  int nbins = 10;
+  double *edges = new double[nbins + 1];
+  edges[0] = vDB_EbinCenter[0] - 0.5 * vDB_EbinWidth[0];
+  for(int i=0;i<nbins;++i){
+    edges[i+1] = vDB_EbinCenter[i] + 0.5 * vDB_EbinWidth[i];
+    //      cout<<edges[i+1]<<endl;
+  }
+  hSpec = new TH1D("hSpec", "hSpec", nbins, edges);
+  for(int i=0; i<nbins; ++i){
+    double low = vDB_EbinCenter[i] - 0.5*vDB_EbinWidth[i];
+    double high = low + vDB_EbinWidth[i];
+    double y = RelDetectorResponseSpectrum(det, low, high, week);
+    hSpec->SetBinContent(i+1,y);
+  }
+  hSpec->SetLineColor(kBlue);
+  hSpec->SetMarkerColor(kRed);
+  hSpec->SetMarkerStyle(7);
+  hSpec->SetTitle(Form("Fractional SNF Contribution to %s for Week %i", 
+		    DName[det].Data(), week));
+  hSpec->Draw();
+  gPad->Update();
+  hSpec->GetYaxis()->SetTitle("Fractional SNF Contribution (%)");
+  hSpec->GetXaxis()->SetTitleSize(0.04);
+  hSpec->GetYaxis()->SetTitleSize(0.04);
+  hSpec->GetXaxis()->SetTitle("Energy (MeV)");
+  gPad->Update();
+  return hSpec;
+}
+
+double SNF::GetSpectrumError()//Relative uncertainty in calculated SNF spectrum
+{
+  return fSpectrumError;
+}
+
+void SNF::IncludeProbSurvival(bool incl)//set whether or not to include survival probability in calculations of reactor weighting
+{
+  fIncludeProbSurvival = incl;
+}
+
+void SNF::InsertRefuelTime(int core)//Use this function to add virtual refuels at a
+//set frequency for the years prior to P15A
+{
+  double offset = 0;
+    if(fAddRandomError)
+      offset = rand->Gaus(0, fRefuelTimeError*vRefuelFreq[core]);
+  vRefuelTimes[core].resize(vRefuelTimes[core].size()+1);
+  for(int i=(int)vRefuelTimes[core].size()-1;i>0;--i)
+    vRefuelTimes[core][i] = vRefuelTimes[core][i-1];
+  vRefuelTimes[core][0] = vRefuelTimes[core][1] - vRefuelFreq[core] + offset;
+}
+
+double SNF::IntegrateDBfluxSpectrum()//total Daya Bay flux for normalization
+{
+  fDBSpectrumIntegral = 0;
+  for(int i=0; i<(int)vDB_EbinCenter.size();++i){
+    fDBSpectrumIntegral += vDB_Spectrum[i] * vDB_EbinWidth[i];
+  }
+    return fDBSpectrumIntegral;
+}
+
+int SNF::IsolateSingleReactorContribution(int core)
+{
+  if(core < 0 || core >= kReactor){
+    fSingleReactor = -1;
+    fIsolateReactorContribution = false;
+    cout<<"Contributions from all reactors now included in calculation.\n";
+  }else{
+    fIsolateReactorContribution = true;
+    fSingleReactor = core;
+    cout<<"Fractional SNF contribution from reactor "<<RName[core].Data();
+    cout<<" being calculated.\n";
+  }
+  return fSingleReactor;
+}
+
+int SNF::LoadReactorPowerTree(const char *filename, const char *treename)
+{
+  TFile *file = new TFile(filename);
+  RPTree = (TTree*)file->Get(treename);
+  fNWeeksInP15A = (int)RPTree->GetEntries();
+  cout<<fNWeeksInP15A<<" weeks of data available.\n";
+  return fNWeeksInP15A;
+}
+
+int SNF::ParameterizeSNFvsT(bool fit)//parameterize decay versus time for each E-bin
+{
+  //Quadruple exponential decay forces fit through all data points by design.
+  TString fnc = "[0]*exp(-[4]*x)+[1]*exp(-[5]*x)+[2]*exp(-[6]*x)"
+     "+[3]*exp(-[7]*x)";
+  double *x = new double[fNTimeBins];
+  double *xe = new double[fNTimeBins];
+  double *ye = new double[fNTimeBins];
+  for(int it = 0;it<fNTimeBins;++it){
+    x[it] = vTime[it];
+    xe[it] = 0.0;
+    ye[it] = 0.0001;
+  }  
+  double *y = new double[fNTimeBins];
+  TVirtualFitter::SetPrecision(1e-12);
+  TF1 *f;
+  for(int ien = 0;ien<fNEnergyBins;++ien){  
+    f = new TF1(Form("f%i",ien), fnc.Data(), 0, 2500);
+    for(int it = 0;it<fNTimeBins;++it){
+      y[it] = vSpectrum[it][ien];
+      xe[it] = 0;
+      ye[it] = 0.01*y[it];
+    }  
+    if(fit){
+      TGraphErrors gr = TGraphErrors(fNTimeBins, x, y, xe, ye);
+      f->SetParameters(0,0,0,0,0,0,0,0);
+      TRandom r(0);
+      TFitResultPtr ftres = gr.Fit(f,"SM");
+      int n = 0;
+      while(int(gr.Fit(f,"S"))==4 && n < 200){
+	for(int i=0; i<f->GetNpar();++i){
+	  f->SetParameter(i,f->GetParameter(i)*(1+r.Gaus(0,0.1)));
+	}
+	++n;
+      }
+      if(n==100)cout<<"YIKES. Fit did not converge.\n";
+    }else{
+      f->SetNpx(10000);
+      for(int ipar=0;ipar<f->GetNpar();++ipar)
+	f->SetParameter(ipar, vParameter[ipar][ien]);
+    }
+    vSNFofT.push_back(f);
+  }
+  return (int)vSNFofT.size();
+}
+
+double SNF::ProbSurvival(double L, double E)//survival probability function of L in km and E in MeV
+{
+  double term1 = pow(cos(Theta13()),4)*SinSq2Theta12()*pow(sin(1.267*DeltaM21sq()*L/E),2);
+  double term2 = SinSq2Theta13()*pow(sin(1.267*DeltaMeeSq()*L/E),2);
+  return 1.0 - term1 - term2;
+  //  return 1.0-SinSq2Theta13()*pow(sin(1.267*DeltaM31sq()*L/E),2);
+}
+
+double SNF::ReactorOffScaling()//SNF scale factor for reactor off
+{
+  return fReactorOffScaling;
+}
+
+double SNF::RatedOutputPower(int core)//reactor rated output power in GW
+{  
+  if(core >= kReactor){
+    cout<<"RatedOutputPower(): Core requested out of range. Exiting.\n";
+    exit(0);
+  }
+
+  return vReactorPower[core];
+}
+
+double SNF::ReactorData(const char *leaf, int week)
+//Reactor data from tree by name of leaf for week since 12/24/2011
+{
+  if(week >= fNWeeksInP15A){
+    cout<<"ReactorPower(): Time requested out of range of P15A. Exiting.\n";
+    exit(0);
+  }
+  RPTree->GetEntry(week);
+  return RPTree->GetLeaf(leaf)->GetValue();
+}
+
+double SNF::ReactorPower(int core, int week)
+//Reactor power for week since 12/24/2011
+{
+  if(core >= kReactor){
+    cout<<"ReactorPower(): Core requested out of range. Exiting.\n";
+    exit(0);
+  }
+  if(week >= fNWeeksInP15A){
+    cout<<"ReactorPower(): Time requested out of range of P15A. Exiting.\n";
+    exit(0);
+  }
+  RPTree->GetEntry(week);
+  return RPTree->GetLeaf(Form("%s_Power", RName[core].Data()))->GetValue();
+}
+
+double SNF::RelDetectorResponseSpectrum(int det, double lowE, double highE, int week)//fractional(%) SNF flux between lowE and highE (in MeV) and for week since beginning of P15A dataset at specified detector location convoluted with measured Daya Bay spectrum. 
+{
+  //approximate integral by summing over Npts bins
+  int Npts = int((highE-lowE)/fDeltaE);
+  double dE = (highE-lowE)/(double)Npts;//multiple of interval close to fDeltaE
+  double sum = 0, norm = 0;
+  for (int ien = 0; ien<Npts; ++ien){
+    double E = lowE + ien * dE; 
+    double relspec = RelSpectrumAtDet(det, E, week);
+    //   cout<<"relspec "<<relspec<<endl;
+    if(relspec == kError)return double(kError);
+    sum += relspec * AbsDayaBaySpectrum(E) * dE;
+    norm += AbsDayaBaySpectrum(E) * dE;
+  }
+  //  cout<<norm<<endl;
+  return sum/norm;
+}
+
+double SNF::RelDetectorResponseSpectrum(int det, double lowE, double highE, int week, int day)//fractional(%) SNF flux between lowE and highE (in MeV) and for week*7+day days since beginning of P15A dataset at specified detector location convoluted with measured Daya Bay spectrum. 
+{
+  //approximate integral by summing over Npts bins
+  int Npts = int((highE-lowE)/fDeltaE);
+  double dE = (highE-lowE)/(double)Npts;//multiple of interval close to fDeltaE
+  double sum = 0, norm = 0;
+  for (int ien = 0; ien<Npts; ++ien){
+    double E = lowE + ien * dE; 
+    double relspec = RelSpectrumAtDet(det, E, week, day);
+    //   cout<<"relspec "<<relspec<<endl;
+    if(relspec == kError)return double(kError);
+    sum += relspec * AbsDayaBaySpectrum(E) * dE;
+    norm += AbsDayaBaySpectrum(E) * dE;
+  }
+  //  cout<<norm<<endl;
+  return sum/norm;
+}
+
+double SNF::RelSpectrumAtDet(int det, double E, int week)//fractional(%) SNF flux at E (in MeV) and week since beginning of P15A dataset at specified detector location (not convoluted with IBD X-section)
+{
+  //Average over days in week. Relevant only just after refuel when change
+  //is rapid. Perhaps at this time even finer time bins should be used.
+  //Use the function evaluated at the center of each day as day average.
+  double fraction = 0, total_power = 0;
+  for(int t=0;t<kDaysInWeek;++t){
+    double frac = 0, norm = 0;
+    for(int icore=0;icore<kReactor;++icore){
+      double psur_num = 1.0;
+      double psur_denom = 1.0;
+      if(fIncludeProbSurvival) {
+	psur_num = ProbSurvival(BaselineSNF(det,icore), E);
+	psur_denom = ProbSurvival(BaselineSNF(det,icore), E);
+      }
+      double rpow = ReactorPower(icore, week);
+      //Note this weighting is not the same as used in "norm" below because RPow
+      //has to cancel the RPow in Beta which is 1.0 for reactor off. However,
+      //norm requires the actual reactor power.
+      double weight = psur_num/pow(BaselineSNF(det, icore),2);
+      double day = t + 0.5 + week * kDaysInWeek;
+      frac += weight * Beta(icore, E, day);
+      norm +=  rpow * psur_denom / pow(BaselineCore(det, icore),2);
+      total_power += rpow;
+    }
+    fraction += frac/norm;
+  }
+  if(total_power > MinOnPower()){
+    fraction /= double(kDaysInWeek);
+  }else fraction = kError;
+  return fraction;
+}
+
+double SNF::RelSpectrumAtDet(int det, double E, int week, int day)//(det, E, week, day)fractional(%) SNF flux at E (in MeV) for week and day(since beginning of week 0-6)for P15A dataset at specified detector location (not convoluted with IBD X-section)
+{
+  if(week + day/kDaysInWeek >= fNWeeksInP15A){
+    cout<<"Requested week outside range of P15A. Exiting.\n";
+    exit(0);
+  }
+  double frac = 0, norm = 0, total_power = 0;
+  for(int icore=0;icore<kReactor;++icore){
+    double psur_num = 1.0;
+    double psur_denom = 1.0;
+    if(fIncludeProbSurvival) {
+	psur_num = ProbSurvival(BaselineSNF(det,icore), E);
+	psur_denom = ProbSurvival(BaselineSNF(det,icore), E);
+      }
+    double rpow = ReactorPower(icore, week);
+    total_power += rpow;
+    double weight = psur_num/pow(BaselineSNF(det, icore),2);
+    double days = week * kDaysInWeek + day;
+    //evaluate at middle of day
+    double partial_day = 0.5;
+    frac += weight * Beta(icore, E, days + partial_day);
+    norm +=  rpow * psur_denom / pow(BaselineCore(det, icore),2);
+    total_power += rpow;
+  }
+  frac/=norm;
+  if(total_power < MinOnPower()){
+    frac = kError;
+  }
+  return frac;
+}
+
+double SNF::RelSpectrumSim(double E, double T)//SNF relative to full power spectrum
+{
+  //energy bin width
+  double E_bw = (vEnergy[fNEnergyBins-1]-vEnergy[0])/double(fNEnergyBins-1);
+
+  //assume 0 for out of range energies
+  if(E<vEnergy[0] || E>=(vEnergy[fNEnergyBins-1] + E_bw))
+    return 0;
+
+  //Use discrete values for energy as in http://arxiv.org/pdf/1512.07353v1.pdf
+  int idx_E = (int)((E-vEnergy[0])/E_bw); 
+
+  //Use parameterization of time decay.
+  return vSNFofT[idx_E]->Eval(T);
+
+}
+
+void SNF::SetAlpha(int core, double a)//set value returned by Alpha(): burnup per cycle for a reactor
+{
+  fBurnupScaleFactor[core] = a;
+  cout<<"Setting burnup scale factor alpha for reactor "<<core<<" to "
+      <<fBurnupScaleFactor[core]<<endl;
+  return;
+}
+
+void SNF::SetAlphaError(double err)//Relative uncertainty in Alpha(): burnup per cycle for a reactor
+{
+  fAlphaError = err;
+  cout<<"Setting error in burnup/cycle to "<<fAlphaError<<endl;
+  return;
+}
+
+void SNF::SetBaselineError(double err)//Absolute ncertainty in reactor to detector baselines
+{
+  fBaselineError = err;
+  cout<<"Setting error in SNF storage to detector baseline to "
+      <<fBaselineError<<endl;
+  return;
+}
+ 
+ void SNF::SetDayLevelPrecision(bool dlp)//set whether or not to use day-level precision of refuel times. Default is week-level precision.
+{
+  cout<<"Using "<<(dlp ? "day" : "week")<<"-level precision";
+  cout<<" for refuel times.\n";
+  fAtDayLevelPrecision = dlp;
+}
+
+void SNF::SetDeltaE(double dE)//set width dE of bin for sum approximation of convolution integral
+{
+  fDeltaE = dE;
+  cout<<"Setting dE bin width for sum approximation of convolution integral to "
+      <<fDeltaE<<endl;
+  return;
+}
+
+void SNF::SetReactorOffScaling(double sc)//Scale SNF by this when reactor  off
+{
+  fReactorOffScaling = sc;
+  cout<<"Setting reactor off scale factor to "<<fReactorOffScaling<<endl;
+  return;
+}
+
+void SNF::SetSpectrumError(double err)//Relative uncertainty in reference SNF spectrum
+{
+  fSpectrumError = err;
+  cout<<"Setting error in reference SNF spectrum "<<fSpectrumError<<endl;
+  return;
+}
+
+double SNF::Theta13()
+{
+  return asin(sqrt(SinSq2Theta13()))/2.0;
+}

@@ -1,0 +1,33 @@
+{
+  TMultiGraph *mg0 = Pu239vsWeekByHall(0);
+  TMultiGraph *mg1 = Pu239vsWeekByHall(1);
+  TCanvas *c = new TCanvas("c","c",0,0,800,500);
+  mg0->Add(mg1);
+  mg0->SetTitle("Effective ^{239}Pu Fuel Fraction vs Week in P15A");
+  mg0->Draw("alp");
+  double x_1 = 0.6, x_2 = 0.76, y_1 = 0.2, y_2 = 0.28; 
+  TPaveText *pt0 = new TPaveText(x_1,y_1,x_2,y_2,"ndc");
+  pt0->SetFillColor(0);
+  pt0->SetBorderSize(0);
+  pt0->SetTextColor(kRed);
+  pt0->SetLineColor(kRed);
+  pt0->AddText(0.6,0, "EH1");
+  TLine *l0 = (TLine*)pt0->AddLine(0.1,0.5,0.3,0.5);
+  l0->SetLineColor(kRed);
+  l0->SetLineWidth(2);
+  pt0->Draw();
+  y_1 -= y_2 - y_1;
+  y_2 = (y_2 + y_1)/2.0;
+  TPaveText *pt1 = new TPaveText(x_1,y_1,x_2,y_2,"ndc");
+  pt1->SetFillColor(0);
+  pt1->SetBorderSize(0);
+  pt1->SetTextColor(kBlack);
+  pt1->SetLineColor(kBlack);
+  pt1->AddText(0.6,0, "EH2");
+  TLine *l1 = (TLine*)pt1->AddLine(0.1,0.5,0.3,0.5);
+  l1->SetLineColor(kBlack);
+  l1->SetLineWidth(2);
+  pt1->Draw();
+  gPad->Update();
+  c->SaveAs("Pu239EffectiveFractionVsWeek.png");
+}
